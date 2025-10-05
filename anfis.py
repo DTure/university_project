@@ -1,10 +1,12 @@
-import numpy as np
-import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from typing import List, Dict
-from itertools import combinations
+import itertools
 import pickle
 
-# Global parameters
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 factor_names = ["x1", "x2", "x3", "x4", "x5", "x6"]
 
 terms_num = {
@@ -16,230 +18,220 @@ terms_num = {
     "x6": {"L":0.15, "M":0.42, "H":0.55, "VH":0.87}
 }
 
-class BetaNode:
-    def __init__(self, conditions: Dict[str, float]):
+def expand_features(x_vec: torch.Tensor, degree: int = 1):
+    if x_vec.dim() == 1:
+        x_vec = x_vec.unsqueeze(0)
+    B, n = x_vec.shape
+    features = [x_vec] 
+
+    if degree == 2:
+        squares = x_vec ** 2
+        features.append(squares)
+        cross_terms = []
+        for i, j in itertools.combinations(range(n), 2):
+            cross_terms.append((x_vec[:, i] * x_vec[:, j]).unsqueeze(1))
+        cross_terms = torch.cat(cross_terms, dim=1) if cross_terms else None
+        if cross_terms is not None:
+            features.append(cross_terms)
+
+    full_features = torch.cat(features, dim=1)
+    return full_features
+
+def get_feature_names(degree: int = 1):
+    names = factor_names.copy()
+    if degree == 2:
+        names += [f"{f}^2" for f in factor_names]
+        for i, j in itertools.combinations(factor_names, 2):
+            names.append(f"{i}*{j}")
+    return names
+
+class BetaNode(nn.Module):
+    def __init__(self, conditions: Dict[str, float], poly_degree: int = 1):
+        super().__init__()
         self.conditions = conditions
-        self.coeffs = self._init_coeffs()
+        self.poly_degree = poly_degree
+        expanded_dim = len(get_feature_names(poly_degree)) + 1
+        coeff_init = torch.randn(expanded_dim) * 0.1
+        self.coeffs = nn.Parameter(coeff_init.to(device))
+        self.frozen_mask = torch.ones_like(self.coeffs, device=device)
         self.activation = 0.0
-        self.frozen_coeffs = set()
-    
-    def _init_coeffs(self):
-        coeffs = {}
-        coeffs['c0'] = np.random.uniform(-0.1, 0.1)
-        for f in factor_names:
-            coeffs[f] = np.random.uniform(-0.1, 0.1)
-        return coeffs
 
-    def calc_z(self, x: Dict[str, float]):
-        z = self.coeffs.get('c0', 0.0)
-        for f in factor_names:
-            z += self.coeffs.get(f, 0.0) * x[f]
-        return z
-
-    """def _init_coeffs(self):
-        coeffs = {}
-        coeffs['c0'] = np.random.uniform(-0.1,0.1)
-        for f in factor_names:
-            coeffs[f] = np.random.uniform(-0.1,0.1)
-            coeffs[f+f] = np.random.uniform(-0.05,0.05)
-        for (i,j) in combinations(factor_names,2):
-            coeffs[i+j] = np.random.uniform(-0.05,0.05)
-        return coeffs
-
-    def calc_z(self, x: Dict[str,float]):
-        z = self.coeffs.get('c0', 0.0)
-        for f in factor_names:
-            z += self.coeffs.get(f, 0.0) * x[f]
-            z += self.coeffs.get(f+f, 0.0) * x[f]**2
-        for (i,j) in combinations(factor_names,2):
-            z += self.coeffs.get(i+j, 0.0) * x[i] * x[j]
-        return z
-    """
-    
-class ANFIS:
-    def __init__(self, rete=None):
-        self.rules: List[BetaNode] = []
+class ANFIS(nn.Module):
+    def __init__(self, rete=None, poly_degree: int = 1):
+        super().__init__()
+        self.rules: List[BetaNode] = nn.ModuleList()
         self.X, self.y = None, None
-        if rete is not None:
-            if not hasattr(rete, "beta_nodes"):
-                raise ValueError("ANFIS waiting ReteNetwork")
-            self.X, self.y = self._convert_rete_to_numpy(rete)
-            self.rules = [
-                BetaNode(dict(zip(factor_names, row))) for row in self.X
-            ]
+        self.poly_degree = poly_degree
+        self.feature_names = get_feature_names(poly_degree)
 
-    def _convert_rete_to_numpy(self, rete):
-        X_list = []
-        y_list = []
+        if rete is not None:
+            self.X, self.y = self._convert_rete_to_tensor(rete)
+            for row in self.X:
+                cond_dict = dict(zip(factor_names, row.tolist()))
+                self.rules.append(BetaNode(cond_dict, poly_degree))
+
+    def initialize_coeffs(self, weights: Dict[str, float], risk_reducing: set):
+        with torch.no_grad():
+            for r in self.rules:
+                for i, f in enumerate(factor_names):
+                    val = weights.get(f, 0.0)
+                    if f in risk_reducing:
+                        val = -val
+                    r.coeffs[i+1].copy_(torch.tensor(val, device=device))
+
+    def _convert_rete_to_tensor(self, rete):
+        X_list, y_list = [], []
         for beta in rete.beta_nodes:
             numeric_conditions = [terms_num[f][term] for f, term in beta.conditions.items()]
             X_list.append(numeric_conditions)
             y_list.append(float(getattr(beta, "R_index", beta.R)))
-        return np.array(X_list, dtype=float), np.array(y_list, dtype=float)
+        X_tensor = torch.tensor(X_list, dtype=torch.float32, device=device)
+        y_tensor = torch.tensor(y_list, dtype=torch.float32, device=device)
+        return X_tensor, y_tensor
 
-    def _calc_activations(self, x: Dict[str,float]):
-        for rule in self.rules:
-            activation = 1.0
-            for f in factor_names:
-                term_value = rule.conditions[f]
-                activation *= max(0.0, 1 - abs(x[f] - term_value))
-            rule.activation = activation
-        total = sum(r.activation for r in self.rules)
-        for r in self.rules:
-            r.activation /= total if total > 0 else 1.0 / len(self.rules)
-    
-    def initialize_coeffs(self, weights: Dict[str,float], risk_reducing: set):
-        signed_weights = {k: (-v if k in risk_reducing else v) for k, v in weights.items()}
-        for r in self.rules:
-            for f in factor_names:
-                r.coeffs[f] = signed_weights.get(f, 0.0)
+    def _calc_activations_batch(self, X_batch):
+        batch_size = X_batch.size(0)
+        n_rules = len(self.rules)
+        X_exp = X_batch.unsqueeze(1).expand(batch_size, n_rules, len(factor_names))  
+        rule_terms = torch.tensor([[rule.conditions[f] for f in factor_names] 
+                                   for rule in self.rules], device=device)
+        rule_terms_exp = rule_terms.unsqueeze(0).expand(batch_size, n_rules, len(factor_names))
+        activations = 1 - torch.abs(X_exp - rule_terms_exp)
+        activations = torch.clamp(activations, min=0.0)
+        activations = torch.prod(activations, dim=2)
+        activations = activations / activations.sum(dim=1, keepdim=True)  
+        return activations
+
+    def _calc_z_batch(self, X_batch):
+        X_poly = expand_features(X_batch, self.poly_degree)
+        coeffs_matrix = torch.stack([r.coeffs * r.frozen_mask for r in self.rules], dim=0)
+        c0 = coeffs_matrix[:, 0]
+        cf = coeffs_matrix[:, 1:]
+        activations = self._calc_activations_batch(X_batch)
+        z_rules = torch.matmul(X_poly, cf.t()) + c0.unsqueeze(0)
+        z_total = (activations * z_rules).sum(dim=1)
+        return z_total
+
+    def predict_batch(self, X_batch):
+        z_total = self._calc_z_batch(X_batch)
+        return torch.sigmoid(z_total)
 
     def predict(self, x: Dict[str,float]):
-        self._calc_activations(x)
-        y_total = sum(r.activation*r.calc_z(x) for r in self.rules)
-        return 1/(1+np.exp(-y_total))
+        X_tensor = torch.tensor([x[f] for f in factor_names], dtype=torch.float32, device=device).unsqueeze(0)
+        return self.predict_batch(X_tensor)[0]
 
-    def train_base(self, lr=0.01, epochs=50, batch_size=32):
-        n = len(self.y)
+    def train_model(self, lr=0.01, epochs=50, batch_size=32):
+        if self.X is None or self.y is None:
+            raise ValueError("No data")
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        n = self.X.size(0)
+
         for ep in range(epochs):
-            mse = 0.0
-            indices = np.random.permutation(n)
-
+            perm = torch.randperm(n)
+            mse_epoch = 0.0
             for i in range(0, n, batch_size):
-                batch_idx = indices[i:i+batch_size]
-                X_batch = self.X[batch_idx]
-                y_batch = self.y[batch_idx]
+                idx = perm[i:i+batch_size]
+                X_batch, y_batch = self.X[idx], self.y[idx]
+                optimizer.zero_grad()
+                y_pred = self.predict_batch(X_batch)
+                loss = ((y_batch - y_pred) ** 2).mean()
+                loss.backward()
+                for r in self.rules:
+                    if hasattr(r, 'frozen_mask'):
+                        r.coeffs.grad *= r.frozen_mask
+                optimizer.step()
+                mse_epoch += loss.item() * X_batch.size(0)
+            mse_epoch /= n
+            print(f"Epoch {ep+1}/{epochs}, MSE={mse_epoch:.6f}")
 
-                grads = [ {k:0.0 for k in r.coeffs} for r in self.rules ]
-
-                for x_vec, y_true in zip(X_batch, y_batch):
-                    x = dict(zip(factor_names, x_vec))
-                    self._calc_activations(x)
-                    z = sum(r.activation * r.calc_z(x) for r in self.rules)
-                    y_pred = 1 / (1 + np.exp(-z))
-                    error = y_true - y_pred
-                    mse += error**2
-                    dL_dz = -2 * error * y_pred * (1 - y_pred)
-
-                    for r_i, r in enumerate(self.rules):
-                        grad = dL_dz * r.activation
-                        grads[r_i]['c0'] += grad
-                        for f in factor_names:
-                            grads[r_i][f] += grad * x[f]
-                            #grads[r_i][f+f] += grad * (x[f]**2)
-                        #for (i,j) in combinations(factor_names,2):
-                           # grads[r_i][i+j] += grad * x[i] * x[j]
-
-                for r, g in zip(self.rules, grads):
-                    for k in r.coeffs:
-                        if k in r.frozen_coeffs:
-                            continue 
-                        r.coeffs[k] -= lr * (g[k] / len(X_batch))
-
-
-            mse /= n
-            print(f"Epoch {ep+1}/{epochs}, MSE={mse:.6f}")
-
-
-    def train_and_reduce(self, initial_epochs=50, batch_size=64, reduction_epochs=20, significance_threshold=0.05,load_filepath=None):
+    def train_and_reduce(self, initial_epochs=50, batch_size=32, reduction_epochs=20, significance_threshold=0.05, load_filepath=None):
         if load_filepath is not None:
             self.load_model(load_filepath)
         else:
-            self.train_base(lr=0.01, epochs=initial_epochs, batch_size=batch_size)
+            self.train_model(lr=0.01, epochs=initial_epochs, batch_size=batch_size)
+        
+        max_rounds = 5
+        round_idx = 0
 
-        def get_insignificant_coeffs(rule, significance_threshold):
-            return [k for k,v in rule.coeffs.items() if k != 'c0' and abs(v) < significance_threshold]
+        while round_idx < max_rounds:
+            print(f"\nModel reduction, round {round_idx+1}")
+            print("Global equation:")
+            print(self.get_global_polynomial_equation())
 
-        reduction_round = 0
-        while reduction_round < 3:
-            reduction_round += 1
-            print(f"\nModel reduction, round {reduction_round}")
-            removed_any = False
+            global_coeffs = self.get_global_coefficients()
+            insignificant = [i for i, c in enumerate(global_coeffs) if abs(c) < significance_threshold]
+
+            new_insignificant = []
+            for i in insignificant:
+                if any(r.frozen_mask[i].item() == 1 for r in self.rules):
+                    new_insignificant.append(i)
+
+            if not new_insignificant:
+                print("Reduction complete.")
+                break
+
+            print(f"Removing coefficients with indices: {insignificant} (|value| < {significance_threshold})")
 
             for r in self.rules:
-                insignificant = get_insignificant_coeffs(r, significance_threshold)
-                if insignificant:
-                    removed_any = True
-                    for k in insignificant:
-                        r.coeffs[k] = 0.0
-                        r.frozen_coeffs.add(k)
+                with torch.no_grad():
+                    for i in insignificant:
+                        r.frozen_mask[i] = 0 
 
-            if not removed_any:
-                print("All coefficients are significant. Reduction complete.")
-                break
-            print(self.get_global_polynomial_equation())
-            print(f"Retraining the model after reduction, epochs={reduction_epochs}")
-            self.train_base(lr=0.01, epochs=reduction_epochs,batch_size=batch_size)
+            self.train_model(lr=0.01, epochs=reduction_epochs, batch_size=batch_size)
+            round_idx += 1
+
     
-    """def get_global_polynomial_equation(self):
-        all_keys = ['c0'] + factor_names + [f+f for f in factor_names] + [i+j for i,j in combinations(factor_names,2)]
-        global_coeffs = {k: 0.0 for k in all_keys}
-        
-        n_rules = len(self.rules)
+    def get_global_coefficients(self):
+        coeff_len = len(self.rules[0].coeffs)
+        global_coeffs = torch.zeros(coeff_len, device=self.rules[0].coeffs.device)
         for r in self.rules:
-            for k in r.coeffs:
-                global_coeffs[k] += r.coeffs[k] / n_rules
+            global_coeffs += (r.coeffs * r.frozen_mask).detach()     
+        global_coeffs /= len(self.rules)
+        return global_coeffs
 
-        terms = []
-        if global_coeffs['c0'] != 0:
-            terms.append(f"{global_coeffs['c0']:.4f}")
-        for f in factor_names:
-            if global_coeffs[f] != 0:
-                terms.append(f"{global_coeffs[f]:.4f}*{f}")
-            if global_coeffs[f+f] != 0:
-                terms.append(f"{global_coeffs[f+f]:.4f}*{f}^2")
-        for (i,j) in combinations(factor_names,2):
-            if global_coeffs[i+j] != 0:
-                terms.append(f"{global_coeffs[i+j]:.4f}*{i}*{j}")
-        
-        equation = " + ".join(terms)
-        return f"R = sigmoid({equation})"
-    """
     def get_global_polynomial_equation(self):
-        all_keys = ['c0'] + factor_names
-        global_coeffs = {k: 0.0 for k in all_keys}
-        
         n_rules = len(self.rules)
+        coeffs_sum = torch.zeros(len(self.feature_names)+1, device=device)
         for r in self.rules:
-            for k in r.coeffs:
-                global_coeffs[k] += r.coeffs[k] / n_rules
-
+            coeffs_sum += (r.coeffs * r.frozen_mask).detach()
+        coeffs_avg = coeffs_sum / n_rules
         terms = []
-        if global_coeffs['c0'] != 0:
-            terms.append(f"{global_coeffs['c0']:.4f}")
-        for f in factor_names:
-            if global_coeffs[f] != 0:
-                terms.append(f"{global_coeffs[f]:.4f}*{f}")
+        if coeffs_avg[0].item() != 0:
+            terms.append(f"{coeffs_avg[0].item():.4f}")
+        for i, f in enumerate(self.feature_names):
+            if coeffs_avg[i+1].item() != 0:
+                terms.append(f"{coeffs_avg[i+1].item():.4f}*{f}")
+        return f"R = sigmoid({' + '.join(terms)})"
 
-        equation = " + ".join(terms)
-        return f"R = sigmoid({equation})"
-
-
-    
     def check_model_adequacy(self, rete_test):
-        X_test, y_true = self._convert_rete_to_numpy(rete_test)
-        X_dicts = [dict(zip(factor_names, row)) for row in X_test]
-        y_pred = np.array([self.predict(x) for x in X_dicts])
-        mae = np.mean(np.abs(y_true - y_pred))
-        rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-        corr = np.corrcoef(y_true, y_pred)[0,1] if len(y_true) > 1 else 0.0
+        X_test, y_true = self._convert_rete_to_tensor(rete_test)
+        y_pred = self.predict_batch(X_test)
+        mae = torch.mean(torch.abs(y_true - y_pred)).item()
+        rmse = torch.sqrt(torch.mean((y_true - y_pred)**2)).item()
+        corr = torch.corrcoef(torch.stack([y_true, y_pred]))[0,1].item() if len(y_true) > 1 else 0.0
         return {'MAE': mae, 'RMSE': rmse, 'Correlation': corr}
-    
+
     def save_model(self, filepath: str):
         data = {
-            'rules': [{ 'conditions': r.conditions, 'coeffs': r.coeffs } for r in self.rules],
-            'factor_names': factor_names
+            'rules': [{ 'conditions': r.conditions, 'coeffs': r.coeffs.detach().cpu()} for r in self.rules],
+            'factor_names': factor_names,
+            'poly_degree': self.poly_degree
         }
         with open(filepath, 'wb') as f:
             pickle.dump(data, f)
         print(f"Model saved in {filepath}")
-    
+
     def load_model(self, filepath: str):
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
-        self.rules = []
+        self.rules = nn.ModuleList()
+        self.poly_degree = data.get('poly_degree', 1)
+        self.feature_names = get_feature_names(self.poly_degree)
         for r_data in data['rules']:
-            r = BetaNode(r_data['conditions'])
-            r.coeffs = r_data['coeffs']
+            r = BetaNode(r_data['conditions'], poly_degree=self.poly_degree)
+            r.coeffs = nn.Parameter(r_data['coeffs'].to(device))
+            r.frozen_mask = torch.ones_like(r.coeffs, device=device)
             self.rules.append(r)
-        print(f"Model load from {filepath}")
+        print(f"Model loaded from {filepath}")
+
+
